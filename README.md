@@ -100,6 +100,7 @@ Claude Code сам запускает `speak.py` на событиях (хуки
 | Тишина при `py speak.py "текст"` | проверьте громкость и устройство вывода; запустите ещё раз — скрипт напишет причину |
 | Говорит голос Windows, а не Светлана | нет интернета или не установлен `edge-tts`: `py -m pip install edge-tts` |
 | Claude Code молчит, а ручная проверка работает | в `settings.json` ошибка JSON (часто — два блока `{ }` подряд). Проверка: `Get-Content $HOME\.claude\settings.json -Raw \| ConvertFrom-Json`. Ещё наберите в Claude Code `/hooks` — там должны быть `Stop` и `PreToolUse` |
+| Часть статусов пропускается или звучит с задержкой | посмотрите журнал: Windows — `Get-Content $env:TEMP\speaker-voice\speaker.log -Tail 50`, macOS/Linux — `tail -50 "${TMPDIR:-/tmp}/speaker-voice/speaker.log"` |
 | Молчит в облачной сессии claude.ai/code | облачные сессии не видят локальные хуки — используйте расширение |
 
 ### Удаление

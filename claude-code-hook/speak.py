@@ -44,6 +44,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 
 MAX_CHARS = int(os.environ.get("SPEAKER_MAX_CHARS", "1500"))
 STATUSES = os.environ.get("SPEAKER_STATUSES", "1") != "0"
@@ -52,9 +53,41 @@ QUEUE = os.path.join(STATE_DIR, "queue.jsonl")
 LOCK = os.path.join(STATE_DIR, "queue.lock")
 HEARTBEAT = os.path.join(STATE_DIR, "worker.alive")
 WATCH = os.path.join(STATE_DIR, "watch.json")
+LOG = os.path.join(STATE_DIR, "speaker.log")
+SYNTH_TIMEOUT = 15  # секунд на синтез одной фразы, дольше — читаем системным голосом
 IDLE_EXIT = 180  # секунд без новых фраз и без изменений журнала — воркер выходит
 WIN = sys.platform == "win32"
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if WIN else 0
+
+
+# ---------- журнал и файлы ----------
+
+def log(msg):
+    """Журнал для диагностики: %TEMP%\\speaker-voice\\speaker.log"""
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 300_000:
+            os.replace(LOG, LOG + ".old")
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} [{os.getpid()}] {msg}\n")
+    except OSError:
+        pass
+
+
+def retry(fn, *args, **kwargs):
+    """Антивирус на Windows ненадолго блокирует свежие файлы — пробуем ещё раз."""
+    for _ in range(40):
+        try:
+            return fn(*args, **kwargs)
+        except PermissionError:
+            time.sleep(0.05)
+    return fn(*args, **kwargs)
+
+
+def write_file(path, text, mode="w"):
+    def _write():
+        with open(path, mode, encoding="utf-8") as f:
+            f.write(text)
+    retry(_write)
 
 
 # ---------- текст из транскрипта ----------
@@ -110,8 +143,7 @@ def take_unspoken(session_id, texts):
     fresh = [(k, t) for k, t in texts if k not in spoken]
     if fresh:
         spoken = (spoken + [k for k, _ in fresh])[-300:]
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(spoken, f)
+        write_file(path, json.dumps(spoken))
     return [t for _, t in fresh]
 
 
@@ -177,7 +209,7 @@ def touch(path):
 def remove(*paths):
     for p in paths:
         try:
-            os.remove(p)
+            retry(os.remove, p)
         except OSError:
             pass
 
@@ -186,9 +218,8 @@ def append_queue(texts):
     """Вызывать под QueueLock."""
     phrases = [p for t in texts for p in split_phrases(clean(t))]
     if phrases:
-        with open(QUEUE, "a", encoding="utf-8") as f:
-            for p in phrases:
-                f.write(json.dumps(p, ensure_ascii=False) + "\n")
+        write_file(QUEUE, "".join(json.dumps(p, ensure_ascii=False) + "\n" for p in phrases), "a")
+        log(f"в очередь +{len(phrases)}: {phrases[0][:60]}")
 
 
 def queue_transcript(transcript_path, session_id, only_last=False):
@@ -197,8 +228,26 @@ def queue_transcript(transcript_path, session_id, only_last=False):
     if only_last:
         texts = texts[-1:]
     fresh = take_unspoken(session_id, texts)
-    append_queue(fresh)
+    try:
+        append_queue(fresh)
+    except OSError:
+        # не смогли поставить в очередь — не считаем озвученным, подхватим в следующий раз
+        forget_spoken(session_id, len(fresh))
+        raise
     return bool(texts)
+
+
+def forget_spoken(session_id, count):
+    if not count:
+        return
+    safe_id = re.sub(r"[^\w-]", "", session_id or "default")
+    path = os.path.join(STATE_DIR, f"spoken-{safe_id}.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            spoken = json.load(f)
+        write_file(path, json.dumps(spoken[:-count]))
+    except (OSError, ValueError):
+        pass
 
 
 def ensure_worker():
@@ -209,6 +258,7 @@ def ensure_worker():
         except OSError:
             pass
         touch(HEARTBEAT)  # сразу, чтобы второй хук не запустил ещё одного
+    log("запускаю фоновый процесс")
     subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--worker"],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -241,47 +291,58 @@ def worker():
     ready = queue.Queue()  # синтезированные фразы, ждущие воспроизведения
     threading.Thread(target=player, args=(engine, ready), daemon=True).start()
 
-    last_activity = time.time()
-    last_mtime = None
+    log("фоновый процесс запущен, голос: " + ("edge" if engine.edge else "system"))
+    state = {"last_activity": time.time(), "last_mtime": None}
     while True:
-        with QueueLock():
-            # слушатель: читаем журнал Claude, как только он изменился
-            watch = None
-            if STATUSES:
-                try:
-                    with open(WATCH, encoding="utf-8") as f:
-                        watch = json.load(f)
-                except (OSError, ValueError):
-                    pass
-            if watch:
-                try:
-                    mtime = os.path.getmtime(watch["transcript_path"])
-                except OSError:
-                    mtime = None
-                if mtime != last_mtime:
-                    last_mtime = mtime
-                    last_activity = time.time()
-                    queue_transcript(watch["transcript_path"], watch.get("session_id"))
-
-            lines = read_queue()
-            if lines:
-                with open(QUEUE, "w", encoding="utf-8") as f:
-                    f.writelines(lines[1:])
-                text = json.loads(lines[0])
-            else:
-                text = None
-                idle = time.time() - last_activity > IDLE_EXIT
-                if idle and ready.unfinished_tasks == 0:
-                    remove(QUEUE, HEARTBEAT)
-                    return
-
+        try:
+            text = worker_step(engine, ready, state)
+        except Exception:
+            log("ошибка в фоновом процессе:\n" + traceback.format_exc())
+            time.sleep(0.5)
+            continue
+        if text is StopIteration:
+            log("фоновый процесс завершён (тишина)")
+            return
         if text is None:
             time.sleep(0.2)
             continue
-        last_activity = time.time()
+        state["last_activity"] = time.time()
         ready.put(engine.synth(text))  # синтез идёт, пока player читает предыдущую
         while ready.qsize() > 1:  # не убегать далеко вперёд
             time.sleep(0.1)
+
+
+def worker_step(engine, ready, state):
+    """Одна итерация: проверить журнал Claude и взять фразу из очереди.
+    -> текст, None (пусто) или StopIteration (пора завершаться)."""
+    with QueueLock():
+        # слушатель: читаем журнал Claude, как только он изменился
+        watch = None
+        if STATUSES:
+            try:
+                with open(WATCH, encoding="utf-8") as f:
+                    watch = json.load(f)
+            except (OSError, ValueError):
+                pass
+        if watch:
+            try:
+                mtime = os.path.getmtime(watch["transcript_path"])
+            except OSError:
+                mtime = None
+            if mtime != state["last_mtime"]:
+                state["last_activity"] = time.time()
+                queue_transcript(watch["transcript_path"], watch.get("session_id"))
+                state["last_mtime"] = mtime  # после успеха — иначе повторим
+
+        lines = read_queue()
+        if lines:
+            write_file(QUEUE, "".join(lines[1:]))
+            return json.loads(lines[0])
+        idle = time.time() - state["last_activity"] > IDLE_EXIT
+        if idle and ready.unfinished_tasks == 0:
+            remove(QUEUE, HEARTBEAT)
+            return StopIteration
+        return None
 
 
 def player(engine, ready):
@@ -290,7 +351,7 @@ def player(engine, ready):
         try:
             engine.play(item)
         except Exception:
-            pass
+            log("ошибка воспроизведения:\n" + traceback.format_exc())
         finally:
             ready.task_done()
 
@@ -309,11 +370,12 @@ class Engine:
                 self.warn(f"пакет edge-tts не установлен ({e})")
 
     def warn(self, msg):
+        log(msg)
         if not self.no_window:
             print(f"speaker-voice: {msg}, читаю системным голосом", file=sys.stderr)
 
     def synth(self, text):
-        """-> ("mp3", путь) или ("text", текст) для системного голоса."""
+        """-> ("mp3", путь, текст) или ("text", None, текст) для системного голоса."""
         if self.edge:
             import asyncio
 
@@ -322,23 +384,29 @@ class Engine:
             rate = os.environ.get("SPEAKER_EDGE_RATE", "+0%")
             fd, path = tempfile.mkstemp(suffix=".mp3", dir=STATE_DIR)
             os.close(fd)
+            started = time.time()
             try:
-                asyncio.run(self.edge.Communicate(text, voice, rate=rate).save(path))
-                return ("mp3", path)
+                communicate = self.edge.Communicate(text, voice, rate=rate)
+                asyncio.run(asyncio.wait_for(communicate.save(path), SYNTH_TIMEOUT))
+                log(f"синтез {time.time() - started:.1f} с: {text[:60]}")
+                return ("mp3", path, text)
             except Exception as e:
                 remove(path)
-                self.warn(f"голос edge недоступен ({e})")
-        return ("text", text)
+                self.warn(f"голос edge недоступен ({type(e).__name__}: {e})")
+        return ("text", None, text)
 
     def play(self, item):
-        kind, value = item
+        kind, path, text = item
         if kind == "mp3":
             try:
-                play_mp3(value)
+                play_mp3(path)
+                return
+            except Exception as e:
+                # фразу не теряем: читаем системным голосом
+                self.warn(f"не удалось проиграть mp3 ({type(e).__name__}: {e})")
             finally:
-                remove(value)
-        else:
-            say_system(value, self.no_window)
+                remove(path)
+        say_system(text, self.no_window)
 
     def say(self, text):
         self.play(self.synth(text))
@@ -354,11 +422,12 @@ def play_mp3(path):
             if err:
                 raise OSError(f"MCI {err}: {c}")
 
-        cmd(f'open "{path}" type mpegvideo alias speakervoice')
+        alias = f"sv{os.getpid()}_{int(time.time() * 1000)}"
+        cmd(f'open "{path}" type mpegvideo alias {alias}')
         try:
-            cmd("play speakervoice wait")
+            cmd(f"play {alias} wait")
         finally:
-            mci("close speakervoice", None, 0, None)
+            mci(f"close {alias}", None, 0, None)
     elif sys.platform == "darwin":
         subprocess.run(["afplay", path], check=True)
     else:
@@ -435,11 +504,11 @@ def main():
     transcript = data.get("transcript_path", "")
     session = data.get("session_id")
 
+    log(f"хук {event}")
     with QueueLock():
         if event == "UserPromptSubmit":
             remove(QUEUE)  # новое сообщение — недочитанное старое уже не нужно
-            with open(WATCH, "w", encoding="utf-8") as f:
-                json.dump({"transcript_path": transcript, "session_id": session}, f)
+            write_file(WATCH, json.dumps({"transcript_path": transcript, "session_id": session}))
         elif event == "Notification":
             append_queue([data.get("message", "")])
         elif event == "PreToolUse" and STATUSES:
@@ -453,4 +522,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        log("ошибка:\n" + traceback.format_exc())
+        raise
