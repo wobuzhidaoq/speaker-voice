@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font: 13px system-ui, sans-serif; width: 300px; margin: 12px; color: #222; }
+    h1 { font-size: 15px; margin: 0 0 10px; }
+    label { display: block; margin: 8px 0 2px; }
+    select, input[type=text], textarea { width: 100%; box-sizing: border-box; }
+    input[type=range] { width: 100%; }
+    .row { display: flex; gap: 6px; margin-top: 10px; }
+    .row button { flex: 1; padding: 6px; cursor: pointer; }
+    .check { display: flex; align-items: center; gap: 6px; }
+    .hint { color: #777; font-size: 11px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>🔊 Speaker Voice</h1>
+
+  <label class="check"><input type="checkbox" id="autoRead" /> Автоматически читать ответы Claude</label>
+  <label class="check"><input type="checkbox" id="skipCode" /> Пропускать блоки кода</label>
+
+  <label for="voiceName">Голос</label>
+  <select id="voiceName"></select>
+
+  <label>Скорость: <span id="rateVal"></span></label>
+  <input type="range" id="rate" min="0.5" max="3" step="0.1" />
+
+  <label>Тон: <span id="pitchVal"></span></label>
+  <input type="range" id="pitch" min="0.5" max="2" step="0.1" />
+
+  <label>Громкость: <span id="volumeVal"></span></label>
+  <input type="range" id="volume" min="0" max="1" step="0.05" />
+
+  <label for="customSelector">Свой CSS-селектор ответов (необязательно)</label>
+  <input type="text" id="customSelector" placeholder=".font-claude-response" />
+
+  <label for="testText">Проверить</label>
+  <textarea id="testText" rows="2">Привет! Задача выполнена, все тесты прошли.</textarea>
+
+  <div class="row">
+    <button id="test">▶ Прочитать</button>
+    <button id="last">↻ Последний ответ</button>
+    <button id="stop">⏹ Стоп</button>
+  </div>
+
+  <div class="hint">
+    Alt+Shift+S — прочитать выделенное, Alt+Shift+X — стоп.<br />
+    Или правый клик по выделению → «Прочитать вслух».
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

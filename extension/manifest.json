@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Speaker Voice — озвучка текста",
+  "version": "1.0.0",
+  "description": "Читает вслух выделенный текст и автоматически озвучивает новые ответы Claude.",
+  "permissions": ["tts", "contextMenus", "storage", "scripting", "activeTab"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Speaker Voice"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "read-selection": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "Прочитать выделенный текст"
+    },
+    "stop-speaking": {
+      "suggested_key": { "default": "Alt+Shift+X" },
+      "description": "Остановить озвучку"
+    }
+  }
+}
